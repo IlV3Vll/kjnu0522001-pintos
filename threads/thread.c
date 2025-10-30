@@ -20,10 +20,6 @@
    of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
 
-/* List of processes in THREAD_READY state, that is, processes
-   that are ready to run but not actually running. */
-static struct list ready_list;
-
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
@@ -55,10 +51,9 @@ static long long kernel_ticks; /* # of timer ticks in kernel threads. */
 static long long user_ticks;   /* # of timer ticks in user programs. */
 
 /* Scheduling. */
-#define TIME_SLICE 4          /* # of timer ticks to give each thread. */
 static unsigned thread_ticks; /* # of timer ticks since last yield. */
 
-/* If false (default), use round-robin scheduler.
+/* If false (default), use preemptive priority scheduler.
    If true, use multi-level feedback queue scheduler.
    Controlled by kernel command-line option "-o mlfqs". */
 bool thread_mlfqs;
@@ -74,6 +69,202 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
+static bool has_priority_greater(const struct list_elem *a, 
+                                 const struct list_elem *b,
+                                 void *aux UNUSED);
+static bool should_preempt (void);
+
+/* Scheduler operations. */
+struct scheduler_ops{
+    void (*init) (void);
+    bool (*is_empty_ready) (void);
+    void (*push_ready) (struct thread*);
+    struct thread* (*pop_ready) (void);
+    struct thread* (*top_ready) (void);
+    void (*on_tick) (void);
+};
+
+/* Points to the active scheduler implementation. */
+struct scheduler_ops* scheduler;
+
+/* MLFQS scheduler implementations. */
+static struct list mlfq_lists[MLFQS_LEVEL_COUNT];
+static const unsigned TIME_SLICES[MLFQS_LEVEL_COUNT]  = { 2, 4, 8 };
+static const int MLFQ_LOWEST_LEVEL  = PRI_MAX - (MLFQS_LEVEL_COUNT + 1);
+
+static void init_mlfqs (void);
+static bool is_empty_ready_mlfqs (void);
+static void push_ready_mlfqs (struct thread*);
+static struct thread* pop_ready_mlfqs (void);
+static struct thread* top_ready_mlfqs (void);
+static void on_tick_mlfqs (void);
+static inline void demote(struct thread*);
+static void age_mlfqs (struct thread *, void *);
+
+struct scheduler_ops mlfqs_ops = {
+    .init = init_mlfqs,
+    .is_empty_ready = is_empty_ready_mlfqs,
+    .push_ready = push_ready_mlfqs,
+    .pop_ready = pop_ready_mlfqs,
+    .top_ready = top_ready_mlfqs,
+    .on_tick = on_tick_mlfqs
+};
+
+static void
+init_mlfqs (void)
+{
+    for (enum mlfqs_level level = 0; level < MLFQS_LEVEL_COUNT; level++)
+        list_init (&mlfq_lists[level]);
+}
+
+static bool
+is_empty_ready_mlfqs (void){
+    for (enum mlfqs_level level = 0; level < MLFQS_LEVEL_COUNT; level++)
+        if (!list_empty (&mlfq_lists[level]))
+            return false;
+    return true;
+}
+
+static void
+push_ready_mlfqs (struct thread* t)
+{
+    list_push_back(&mlfq_lists[MLFQS_LEVEL_Q0], &t->elem);
+}
+
+static struct thread*
+pop_ready_mlfqs (void)
+{    
+    for (enum mlfqs_level level = 0; level < MLFQS_LEVEL_COUNT; level++)
+        if (!list_empty (&mlfq_lists[level]))
+            return list_entry (list_pop_front (&mlfq_lists[level]), struct thread, elem);
+    ASSERT(false);
+}
+
+static struct thread*
+top_ready_mlfqs (void)
+{    
+    for (enum mlfqs_level level = 0; level < MLFQS_LEVEL_COUNT; level++)
+        if (!list_empty (&mlfq_lists[level]))
+            return list_entry (list_front (&mlfq_lists[level]), struct thread, elem);
+    ASSERT(false);
+}
+
+static void
+on_tick_mlfqs (void)
+{
+    thread_foreach(age_mlfqs, NULL);
+
+    struct thread* cur = thread_current();
+    const int level = PRI_MAX - cur->priority;
+
+    /* Enforce preemption. */
+    if (++thread_ticks >= TIME_SLICES[level])
+        demote(cur);
+    
+    if (should_preempt())
+        intr_yield_on_return ();
+}
+
+static inline void
+demote(struct thread* t){
+    if(t->priority > MLFQ_LOWEST_LEVEL)
+        t->priority--;
+}
+
+static void
+age_mlfqs (struct thread *t, void *aux UNUSED)
+{
+    if (t->status != THREAD_READY || t->priority == PRI_AGING_MAX)
+        return;
+    t->age++;
+
+    if (t->age < AGING_CRETERIA)
+        return;
+
+    t->age = 0;
+
+    t->priority++;
+    list_remove(&t->elem);
+    scheduler->push_ready(t);
+}
+
+/* Preemptive priority scheduler implementations. */
+static struct list ready_list;
+static const unsigned TIME_SLICE  = 4;
+
+static void init_priority (void);
+static bool is_empty_ready_priority (void);
+static void push_ready_priority (struct thread*);
+static struct thread* pop_ready_priority (void);
+static struct thread* top_ready_priority (void);
+static void on_tick_priority (void);
+static void age_priority (struct thread *t, void *aux);
+
+struct scheduler_ops priority_ops = {
+    .init = init_priority,
+    .is_empty_ready = is_empty_ready_priority,
+    .push_ready = push_ready_priority,
+    .pop_ready = pop_ready_priority,
+    .top_ready = top_ready_priority,
+    .on_tick = on_tick_priority
+};
+
+static void
+init_priority (void)
+{
+    list_init (&ready_list);
+}
+
+static bool
+is_empty_ready_priority (void){
+    return list_empty(&ready_list);
+}
+
+static void
+push_ready_priority (struct thread* t)
+{
+    list_insert_ordered(&ready_list, &t->elem, has_priority_greater, NULL);
+}
+
+static struct thread*
+pop_ready_priority (void)
+{
+    return list_entry(list_pop_front(&ready_list), struct thread, elem);
+}
+
+static struct thread*
+top_ready_priority (void)
+{
+    return list_entry(list_front(&ready_list), struct thread, elem);
+}
+
+static void
+on_tick_priority (void)
+{
+
+    thread_foreach(age_priority, NULL);
+
+    /* Enforce preemption. */
+    if (++thread_ticks >= TIME_SLICE || should_preempt())
+        intr_yield_on_return ();
+}
+
+static void
+age_priority (struct thread *t, void *aux UNUSED)
+{
+    if (t->status != THREAD_READY || t->priority >= PRI_AGING_MAX)
+        return;
+    t->age++;
+
+    if (t->age < AGING_CRETERIA)
+        return;
+
+    t->age = 0;
+
+    t->priority++;
+    list_remove(&t->elem);
+    scheduler->push_ready(t);
+}
 
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
@@ -93,10 +284,16 @@ thread_init (void)
 {
     ASSERT (intr_get_level () == INTR_OFF);
 
+    if (thread_mlfqs)
+        scheduler = &mlfqs_ops;
+    else
+        scheduler = &priority_ops;
+
+    scheduler->init();
     lock_init (&tid_lock);
-    list_init (&ready_list);
     list_init (&all_list);
     list_init (&sleep_list);
+
 
     /* Set up a thread structure for the running thread. */
     initial_thread = running_thread ();
@@ -139,9 +336,7 @@ thread_tick (void)
     else
         kernel_ticks++;
 
-    /* Enforce preemption. */
-    if (++thread_ticks >= TIME_SLICE)
-        intr_yield_on_return ();
+    scheduler->on_tick();
 }
 
 /* Prints thread statistics. */
@@ -250,8 +445,12 @@ thread_unblock (struct thread *t)
 
     old_level = intr_disable ();
     ASSERT (t->status == THREAD_BLOCKED);
-    list_push_back (&ready_list, &t->elem);
+    scheduler->push_ready(t);
     t->status = THREAD_READY;
+    t->age = 0;
+
+    if(!intr_context () && should_preempt())
+        thread_yield();
     intr_set_level (old_level);
 }
 
@@ -378,7 +577,7 @@ thread_yield (void)
 
     old_level = intr_disable ();
     if (cur != idle_thread)
-        list_push_back (&ready_list, &cur->elem);
+        scheduler->push_ready(cur);
     cur->status = THREAD_READY;
     schedule ();
     intr_set_level (old_level);
@@ -401,11 +600,37 @@ thread_foreach (thread_action_func *func, void *aux)
         }
 }
 
+static bool
+has_priority_greater(const struct list_elem *a, 
+                        const struct list_elem *b,
+                        void *aux UNUSED){
+    struct thread *thread_a = list_entry(a, struct thread, elem);
+    struct thread *thread_b = list_entry(b, struct thread, elem);
+
+    return thread_a->priority > thread_b->priority;
+}
+
+static bool
+should_preempt (void){
+    if (scheduler->is_empty_ready())
+        return false;
+
+    struct thread *cur = thread_current();
+    struct thread *next = scheduler->top_ready();
+
+    if(cur->priority < next->priority)
+        return true;
+    return false;
+}
+
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void
 thread_set_priority (int new_priority)
 {
     thread_current ()->priority = new_priority;
+
+    if(should_preempt ())
+        thread_yield();
 }
 
 /* Returns the current thread's priority. */
@@ -529,7 +754,12 @@ init_thread (struct thread *t, const char *name, int priority)
     t->status = THREAD_BLOCKED;
     strlcpy (t->name, name, sizeof t->name);
     t->stack = (uint8_t *)t + PGSIZE;
-    t->priority = priority;
+
+    if (thread_mlfqs)
+        t->priority = PRI_MAX;
+    else
+        t->priority = priority;
+
     t->magic = THREAD_MAGIC;
     list_push_back (&all_list, &t->allelem);
 }
@@ -555,10 +785,10 @@ alloc_frame (struct thread *t, size_t size)
 static struct thread *
 next_thread_to_run (void)
 {
-    if (list_empty (&ready_list))
+    if (scheduler->is_empty_ready())
         return idle_thread;
     else
-        return list_entry (list_pop_front (&ready_list), struct thread, elem);
+        return scheduler->pop_ready();
 }
 
 /* Completes a thread switch by activating the new thread's page

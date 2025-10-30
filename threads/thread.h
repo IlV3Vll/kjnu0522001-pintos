@@ -14,6 +14,15 @@ enum thread_status
     THREAD_DYING    /* About to be destroyed. */
 };
 
+/* MLFQS queue levels */
+enum mlfqs_level
+{
+    MLFQS_LEVEL_Q0 = 0,
+    MLFQS_LEVEL_Q1,
+    MLFQS_LEVEL_Q2,
+    MLFQS_LEVEL_COUNT
+};
+
 /* Thread identifier type.
    You can redefine this to whatever type you like. */
 typedef int tid_t;
@@ -23,6 +32,10 @@ typedef int tid_t;
 #define PRI_MIN 0      /* Lowest priority. */
 #define PRI_DEFAULT 31 /* Default priority. */
 #define PRI_MAX 63     /* Highest priority. */
+
+/* Constants used for aging*/
+#define PRI_AGING_MAX PRI_DEFAULT
+#define AGING_CRETERIA 20
 
 /* A kernel thread or user process.
 
@@ -89,6 +102,7 @@ struct thread
     uint8_t *stack;            /* Saved stack pointer. */
     int priority;              /* Priority. */
     struct list_elem allelem;  /* List element for all threads list. */
+    int age;                   /* Age for preventing starvation. */
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem; /* List element. */
